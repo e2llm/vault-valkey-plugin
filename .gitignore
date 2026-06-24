@@ -1,0 +1,26 @@
+# Binary
+/valkey-database-plugin
+/dist/
+
+# Go build cache
+.gocache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.test
+coverage.out
+coverage.html
+
+# Spike / integration runtime scratch (configs are generated; node data is throwaway)
+test/sentinel/.run/

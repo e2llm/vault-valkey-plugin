@@ -1,0 +1,197 @@
+package valkey
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// Persistence modes control how a created/updated/deleted ACL user is made
+// durable on each node. Runtime ACL changes are lost on restart unless saved.
+const (
+	// PersistenceACLFile runs `ACL SAVE` after each change (requires aclfile).
+	PersistenceACLFile = "aclfile"
+	// PersistenceRewrite runs `CONFIG REWRITE` after each change (users in the
+	// main config file). Note CONFIG REWRITE does NOT imply ACL SAVE.
+	PersistenceRewrite = "rewrite"
+	// PersistenceNone performs no persistence — only safe where the operator
+	// persists ACLs out-of-band or accepts loss on restart.
+	PersistenceNone = "none"
+)
+
+// Config is the parsed connection configuration for a Valkey database backend.
+type Config struct {
+	// Sentinel discovery (preferred). When Sentinels is non-empty the plugin
+	// resolves the current master and live replicas dynamically per operation.
+	Sentinels          []string
+	SentinelMasterName string
+	// Separate, low-privilege identity for talking to the Sentinels. Kept
+	// distinct from the node admin credentials by design.
+	SentinelUsername string
+	SentinelPassword string
+
+	// Standalone fallback (used only when Sentinels is empty).
+	Host string
+	Port int
+
+	// Node admin credentials used to run ACL SETUSER/DELUSER on the data nodes.
+	Username string
+	Password string
+
+	// Durability of ACL changes on each node.
+	PersistenceMode string
+
+	// TLS to the nodes and Sentinels.
+	TLS         bool
+	InsecureTLS bool
+	CACert      string
+	TLSCert     string
+	TLSKey      string
+
+	// PasswordHashing sends a SHA-256 hash (#<hex>) to ACL SETUSER instead of the
+	// cleartext password, so cleartext never reaches a node's command log. Default true.
+	PasswordHashing bool
+
+	// UsernameTemplate overrides the generated dynamic username format.
+	UsernameTemplate string
+}
+
+func parseConfig(raw map[string]interface{}) (Config, error) {
+	c := Config{
+		Sentinels:          cfgCSV(raw, "sentinels"),
+		SentinelMasterName: cfgString(raw, "sentinel_master_name"),
+		SentinelUsername:   cfgString(raw, "sentinel_username"),
+		SentinelPassword:   cfgString(raw, "sentinel_password"),
+		Host:               cfgString(raw, "host"),
+		Port:               cfgInt(raw, "port", 6379),
+		Username:           cfgString(raw, "username"),
+		Password:           cfgString(raw, "password"),
+		PersistenceMode:    strings.ToLower(cfgString(raw, "persistence_mode")),
+		TLS:                cfgBool(raw, "tls"),
+		InsecureTLS:        cfgBool(raw, "insecure_tls"),
+		CACert:             cfgString(raw, "ca_cert"),
+		TLSCert:            cfgString(raw, "tls_cert"),
+		TLSKey:             cfgString(raw, "tls_key"),
+		PasswordHashing:    cfgBoolDefault(raw, "password_hashing", true),
+		UsernameTemplate:   cfgString(raw, "username_template"),
+	}
+	if c.PersistenceMode == "" {
+		c.PersistenceMode = PersistenceACLFile
+	}
+	if err := c.validate(); err != nil {
+		return Config{}, err
+	}
+	return c, nil
+}
+
+func (c *Config) validate() error {
+	sentinelMode := len(c.Sentinels) > 0
+	if sentinelMode && c.SentinelMasterName == "" {
+		return errors.New("sentinel_master_name is required when sentinels is set (e.g. sentinel_master_name=mymaster)")
+	}
+	if !sentinelMode && c.Host == "" {
+		return errors.New("either sentinels + sentinel_master_name (Sentinel mode) or host (standalone) must be set")
+	}
+	if c.Username == "" || c.Password == "" {
+		return errors.New("username and password (Valkey node admin credentials) are required")
+	}
+	switch c.PersistenceMode {
+	case PersistenceACLFile, PersistenceRewrite, PersistenceNone:
+	default:
+		return fmt.Errorf("invalid persistence_mode %q (want one of: aclfile, rewrite, none)", c.PersistenceMode)
+	}
+	if c.TLSCert != "" && c.TLSKey == "" || c.TLSCert == "" && c.TLSKey != "" {
+		return errors.New("tls_cert and tls_key must be supplied together")
+	}
+	return nil
+}
+
+// --- defensive config decoding (Vault passes everything as map[string]interface{}) ---
+
+func cfgString(m map[string]interface{}, k string) string {
+	v, ok := m[k]
+	if !ok || v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func cfgBool(m map[string]interface{}, k string) bool {
+	v, ok := m[k]
+	if !ok {
+		return false
+	}
+	switch b := v.(type) {
+	case bool:
+		return b
+	case string:
+		parsed, _ := strconv.ParseBool(strings.TrimSpace(b))
+		return parsed
+	default:
+		return false
+	}
+}
+
+// cfgBoolDefault is cfgBool with a default applied when the key is absent.
+func cfgBoolDefault(m map[string]interface{}, k string, def bool) bool {
+	if _, ok := m[k]; !ok {
+		return def
+	}
+	return cfgBool(m, k)
+}
+
+func cfgInt(m map[string]interface{}, k string, def int) int {
+	v, ok := m[k]
+	if !ok {
+		return def
+	}
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
+	case string:
+		if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+			return i
+		}
+	}
+	return def
+}
+
+func cfgCSV(m map[string]interface{}, k string) []string {
+	// Accept a comma-separated string ("a:26379,b:26379") or a list.
+	if v, ok := m[k]; ok {
+		if list, ok := v.([]interface{}); ok {
+			out := make([]string, 0, len(list))
+			for _, e := range list {
+				if s := strings.TrimSpace(fmt.Sprintf("%v", e)); s != "" {
+					out = append(out, s)
+				}
+			}
+			return out
+		}
+	}
+	s := cfgString(m, k)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
