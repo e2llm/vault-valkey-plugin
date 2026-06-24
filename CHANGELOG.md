@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/); releases are cut by tagging `vX.Y.Z`
 (see `PUBLIC-RELEASE-CHECKLIST.md`). The release section becomes the GitHub release notes.
 
-## v0.1.0
+## v1.0.0
 
 First release of the Valkey database secrets plugin (`dbplugin v5`).
 
