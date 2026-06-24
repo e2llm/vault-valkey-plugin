@@ -31,9 +31,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.11.4 # match GitLab's golangci-lint:v2.11 (built with Go >=1.25)
 
   govulncheck:
     runs-on: ubuntu-latest
