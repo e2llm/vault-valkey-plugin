@@ -4,9 +4,9 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/); releases are cut by tagging `vX.Y.Z`
 (see `PUBLIC-RELEASE-CHECKLIST.md`). The release section becomes the GitHub release notes.
 
-## Unreleased
+## v0.1.0
 
-Initial scaffolding of the Valkey database secrets plugin (`dbplugin v5`).
+First release of the Valkey database secrets plugin (`dbplugin v5`).
 
 - Sentinel topology discovery (resolve current master + live replicas, tolerate a dead
   Sentinel) with a separate low-privilege Sentinel discovery identity.
