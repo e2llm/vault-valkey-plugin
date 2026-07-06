@@ -8,7 +8,7 @@ issues **dynamic Valkey credentials** across a **Sentinel-managed** primary/repl
 topology — including correct behaviour across failover — and supports a **separate,
 low-privilege identity for Sentinel discovery**.
 
-> Status: **pre-release (v0.x).** Production-hardened — unit, live-cluster integration,
+> Status: **released (v1.1.0).** Production-hardened — unit, live-cluster integration,
 > and real-Vault end-to-end tests pass on Vault 1.14 and 1.21; see `CHANGELOG.md`.
 
 ## Why a dedicated plugin
@@ -63,7 +63,7 @@ vault read database/creds/app-reader
 |-------|----------|-------------|
 | `sentinels` | Sentinel mode | Comma-separated `host:port` of the Sentinels |
 | `sentinel_master_name` | Sentinel mode | Monitored primary name (e.g. `mymaster`) |
-| `sentinel_username` / `sentinel_password` | no | Separate identity for Sentinel discovery |
+| `sentinel_username` / `sentinel_password` | no | Identity for Sentinel discovery (and, in `shared` mode, a Sentinel admin that runs `ACL SETUSER`/`DELUSER` on the Sentinels) |
 | `host` / `port` | standalone | Single-node fallback (no Sentinel) |
 | `username` / `password` | yes | Node admin identity used to run `ACL SETUSER`/`DELUSER` |
 | `persistence_mode` | no | `aclfile` (default, runs `ACL SAVE`), `rewrite` (`CONFIG REWRITE`), or `none` |
@@ -71,6 +71,38 @@ vault read database/creds/app-reader
 | `ca_cert` / `tls_cert` / `tls_key` | no | PEM material for TLS |
 | `password_hashing` | no | Send a SHA-256 hash to `ACL SETUSER` instead of cleartext (default `true`) |
 | `username_template` | no | Override the generated dynamic username format |
+| `sentinel_identity_mode` | no | `separate` (default) or `shared` — see [Shared identity](#shared-identity) |
+| `sentinel_persistence_mode` | no | Sentinel-side durability in `shared` mode: `none` (default, ephemeral) or `aclfile`. `rewrite` is rejected (Sentinels have no `CONFIG REWRITE`) |
+| `sentinel_creation_statements` | no | Override the Sentinel-side discovery ACL (`shared` mode); default is a narrow read-only set |
+
+## Shared identity
+
+By default the dynamic user lives only on the data nodes and Sentinel discovery uses a
+separate identity (the secure model). For a **legacy app that authenticates to both the
+Valkey nodes and the Sentinels with one credential**, set `sentinel_identity_mode=shared`:
+the same dynamic user is also provisioned on the Sentinels with a narrow read-only
+discovery ACL — it can resolve the master but not trigger failover.
+
+```bash
+vault write database/config/my-valkey \
+    plugin_name="valkey-database-plugin" \
+    sentinels="10.0.0.1:26379,10.0.0.2:26379,10.0.0.3:26379" \
+    sentinel_master_name="mymaster" \
+    sentinel_username="vault-sentinel-admin" \
+    sentinel_password="$SENTINEL_ADMIN_PW" \
+    sentinel_identity_mode="shared" \
+    sentinel_persistence_mode="aclfile" \
+    username="vault-admin" password="$NODE_ADMIN_PW" \
+    allowed_roles="legacy-app"
+```
+
+- `sentinel_username`/`sentinel_password` must be a **Sentinel admin** (it runs
+  `ACL SETUSER`/`DELUSER` on the Sentinels), not just a discovery user.
+- Sentinel-side users are **ephemeral** unless you configure an `aclfile` on the Sentinels
+  *and* set `sentinel_persistence_mode=aclfile`. Ephemeral is fine where Sentinels are
+  stable and the app re-fetches credentials on restart.
+- Shared identity is **less secure** than separate identities (the app credential reaches
+  the Sentinel control plane). Prefer separate identities where the client supports them.
 
 ## Compatibility
 
@@ -88,6 +120,9 @@ vault read database/creds/app-reader
 - Use a **separate, low-privilege** Sentinel discovery user (`sentinel_username`); on
   Valkey 9.0+ give it `+failover` and `+client`.
 - Enable **TLS** in production — without it, client `AUTH` traffic is cleartext.
+- **Restrict `read` on `database/config/*` to operators** — Vault returns plugin-specific
+  secrets (`sentinel_password`, `tls_key`) on a connection read; it masks only the built-in
+  `password`.
 
 ## Testing
 

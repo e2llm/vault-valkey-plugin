@@ -1,6 +1,7 @@
 # Design: Vault Dynamic Credentials for Valkey behind Sentinel
 
 Technical design for the `valkey-database-plugin` (Vault/OpenBao `dbplugin v5`).
+For the market survey and strategic rationale see `docs/landscape.md` and `docs/plan.md`.
 
 ## 1. Problem
 
@@ -24,8 +25,9 @@ concern from data access, and should use a separate, low-privilege identity.
 **Non-goals (now)**
 - Redis **Cluster** mode (sharded). We target Sentinel/replication. The structure
   leaves room for it but it is not implemented.
-- Provisioning dynamic users **onto the Sentinels** (fragile persistence; see §7).
-- Static roles / root rotation (future).
+- Provisioning dynamic users onto the Sentinels *by default* — separate identities are
+  the default. The opt-in shared-identity mode (§7.1) does provision onto the Sentinels.
+- Static roles (future). Root rotation is implemented (§5).
 
 ## 3. The load-bearing finding: ACL users are node-local
 
@@ -100,16 +102,38 @@ command list would break against an older or newer engine that lacks/renames a v
 ## 7. Sentinel discovery identity
 
 The plugin authenticates to Sentinel with `sentinel_username`/`sentinel_password`,
-**separate** from the node admin credentials. It does **not** create dynamic users on
-the Sentinels: Sentinel ACL persistence is undocumented/fragile and no tooling supports
-it. Operators should provision a **static, low-privilege discovery user** on the
-Sentinels. On **Valkey 9.0+** that user additionally needs `+failover` and `+client`.
+**separate** from the node admin credentials. By default
+(`sentinel_identity_mode=separate`) it does **not** create dynamic users on the Sentinels;
+operators provision a **static, low-privilege discovery user** there. The opt-in
+shared-identity mode (§7.1) changes this for legacy single-credential apps. On **Valkey
+9.0+** the discovery user additionally needs `+failover` and `+client`.
 
 The node admin user (`username`/`password`) should also be a **dedicated** account —
 *not* the identity Sentinel uses to authenticate to the nodes (`sentinel auth-pass`).
 Otherwise `vault rotate-root` of the plugin admin would change the password Sentinel
 relies on and break monitoring. Use e.g. a `vaultadmin` node user for the plugin and keep
 Sentinel's node-auth user separate (the test fixture and `test/vault/e2e.sh` do this).
+
+### 7.1 Shared identity (opt-in)
+
+Some legacy apps authenticate to **both** the data nodes and the Sentinels with a single
+credential and cannot be given two. For them, `sentinel_identity_mode=shared` provisions
+the dynamic user onto the Sentinels too, with a **narrow discovery ACL**
+(`+@connection +sentinel|get-master-addr-by-name +sentinel|replicas +sentinel|sentinels`,
+overridable via `sentinel_creation_statements`): it resolves the master but is denied
+`SENTINEL failover`/`monitor`/`remove`/`set`. In this mode `sentinel_username`/`password`
+must be a **Sentinel admin** (it now runs `ACL SETUSER`/`DELUSER` on the Sentinels).
+
+Empirically (`test/sentinel/spike.sh` INV-6..8): a Sentinel accepts a runtime ACL user but
+has **no `CONFIG REWRITE`**, so the user is ephemeral unless the operator configures an
+**aclfile** on the Sentinels (then `ACL SAVE` persists it). Hence `sentinel_persistence_mode`
+is `none` (default, ephemeral) or `aclfile`; `rewrite` is rejected. Provisioning is
+best-effort with a **quorum of one** (so an issued credential is always usable for
+discovery); revocation is **best-effort** on the Sentinels (a lingering discovery user
+cannot reach data — the data nodes already revoked it — and ephemeral Sentinels self-clean
+on restart). On **Valkey 9.0+** the discovery ACL may need `+client`; widen it via
+`sentinel_creation_statements` (untested here — the validated engines are redis 7 / valkey 8).
+Separate identities remain the default and the more secure model.
 
 ## 8. Failure handling
 
@@ -121,7 +145,7 @@ Sentinel's node-auth user separate (the test fixture and `test/vault/e2e.sh` do 
 - **Revoke after failover** → topology is re-resolved, so DELUSER targets the current
   primary and the live replicas.
 
-Known edge to harden: a replica that is down at
+Known edge to harden (see `docs/plan.md` test matrix): a replica that is down at
 create time and returns later will lack the user until the next operation touches it.
 A reconciliation pass (re-assert active leases across the current node set) is the
 planned mitigation.
@@ -138,15 +162,21 @@ planned mitigation.
 
 - **Unit** — config parsing/validation, ACL rule rendering, username templating,
   Sentinel replica-flag filtering.
-- **Spike** (`test/sentinel/spike.sh`) — live 1+2+3 podman topology proving node-locality,
-  persistence, failover correctness, and node-local revoke. Runs on Valkey 8 and 9.
+- **Spike** (`test/sentinel/spike.sh`) — live 1+2+3 podman topology. INV-1..5 prove
+  node-locality, persistence, failover correctness, and node-local revoke. INV-6..8 prove
+  the shared-identity Sentinel facts: a hashed runtime discovery user resolves the master
+  but is denied failover; a Sentinel has no `CONFIG REWRITE`; an aclfile-configured
+  Sentinel persists the user across restart. Runs on Valkey 8 and 9; the same Sentinel-ACL
+  behavior was independently confirmed on redis 7.4 (the target engine).
 - **Integration** (build-tagged, SDK `dbplugin/v5/testing` harness) — drives the plugin
   against the live topology: node-local presence/absence, hashed-password-still-
   authenticates, ACL key-scoping, and a plugin-driven failover-mid-lease scenario.
 - **Real-Vault e2e** (`test/vault/e2e.sh`) — a `vault server -dev` with the plugin
-  registered, exercising config → role → `creds` → `lease revoke` end-to-end, plus a
-  negative test that a `nopass` role is refused.
-- **Matrix** (planned) — failover-during-lease, partial-node failure,
+  registered, exercising config → role → `creds` → `lease revoke` end-to-end, a negative
+  test that a `nopass` role is refused, and a **shared-identity** scenario: one issued
+  credential present on the data nodes *and* the Sentinels, discovering the master via a
+  Sentinel and denied failover, then revoked from both planes.
+- **Matrix** (planned, `docs/plan.md`) — failover-during-lease, partial-node failure,
   revoke retry, restart persistence, version deltas, Vault version floor.
 
 ## 11. Security model
@@ -162,11 +192,20 @@ planned mitigation.
   `+cluster`/`+failover`). Warn-logged: over-broad grants (`+@all`/`~*`/`&*`) — `@all`
   includes admin and can persist past the lease, so prefer scoped categories. A role thus
   cannot mint a passwordless, disabled, backdoored, or lease-escaping user.
-- **Separate Sentinel identity** — discovery uses `sentinel_username`/`sentinel_password`,
-  never the node admin creds; the plugin never provisions onto the Sentinels.
+- **Separate Sentinel identity (default)** — discovery uses `sentinel_username`/
+  `sentinel_password`, never the node admin creds; by default the plugin does not
+  provision onto the Sentinels.
+- **Shared-identity blast radius (opt-in)** — `sentinel_identity_mode=shared` puts the app
+  credential on the Sentinel control plane, but the narrow discovery ACL denies
+  failover/monitor/admin, so a leaked credential can only enumerate topology, not drive
+  it. Wider than separate mode but bounded; opt-in and warned at init.
 - **Secret redaction** — the error-sanitizer middleware scrubs the node password, sentinel
   password, and TLS key from any error returned to Vault. Operational logs carry
   usernames/roles/node counts — never secrets.
+- **Connection config is secret-bearing on read** — `vault read database/config/<name>`
+  returns plugin-specific secrets (`sentinel_password`, `tls_key`/`tls_cert`) in cleartext;
+  Vault masks only the built-in `password`. The plugin cannot mask them (Vault persists and
+  returns the connection config), so restrict `read` on `database/config/*` to operators.
 - **Transport** — TLS to nodes and Sentinels; the plugin warns when TLS is disabled
   (client `AUTH` is still cleartext) and when `insecure_tls` disables verification.
 - **Reset-first create** — `ACL SETUSER <u> reset on …` yields a deterministic user even

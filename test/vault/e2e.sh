@@ -22,7 +22,7 @@ bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=1; }
 
 cleanup() {
   [ -n "$VAULT_PID" ] && kill "$VAULT_PID" 2>/dev/null || true
-  for n in primary replica1 replica2 sentinel1 sentinel2 sentinel3; do podman rm -f "vk-$n" >/dev/null 2>&1 || true; done
+  for n in primary replica1 replica2 sentinel1 sentinel2 sentinel3 saclf; do podman rm -f "vk-$n" >/dev/null 2>&1 || true; done
   podman network rm vkspike >/dev/null 2>&1 || true
   rm -rf "$PLUGIN_DIR"
 }
@@ -92,13 +92,50 @@ for n in primary replica1 replica2; do
   node_has_user "$n" "$USERNAME" && bad "still present on $n after revoke" || ok "removed on $n"
 done
 
-echo "=== 10. root rotation (vault rotate-root), then verify issuance still works ==="
+echo "=== 10. shared-identity mode: ONE dynamic credential for data nodes AND Sentinels ==="
+# The spike Sentinels run with a nopass 'default' user, so the plugin's Sentinel
+# identity (unset here) connects as that admin and can ACL SETUSER on them.
+sent_has_user() { podman exec "vk-$1" valkey-cli -p 26379 ACL LIST | grep -q "^user $2 "; }
+vault write database/config/valkey-shared \
+  plugin_name=valkey-database-plugin \
+  sentinels="10.111.0.21:26379,10.111.0.22:26379,10.111.0.23:26379" \
+  sentinel_master_name=mymaster \
+  sentinel_identity_mode=shared \
+  username=vaultadmin password=vaultpass \
+  persistence_mode=aclfile \
+  allowed_roles="shared-app" >/dev/null && ok "shared-mode connection written" || bad "shared config write"
+vault write database/roles/shared-app db_name=valkey-shared \
+  creation_statements="~app:* +@read +@write +@stream" default_ttl=5m max_ttl=1h >/dev/null && ok "shared-app role written" || bad "shared role write"
+
+SCREDS="$(vault read -format=json database/creds/shared-app)"
+SUSER="$(echo "$SCREDS" | jq -r .data.username)"
+SPASS="$(echo "$SCREDS" | jq -r .data.password)"
+{ [ -n "$SUSER" ] && [ -n "$SPASS" ]; } && ok "issued shared-mode user: $SUSER" || bad "no shared creds issued"
+
+for n in primary replica1 replica2; do node_has_user "$n" "$SUSER" && ok "data node $n has the user" || bad "data node $n missing the user"; done
+SOK=0; for s in sentinel1 sentinel2 sentinel3; do sent_has_user "$s" "$SUSER" && SOK=$((SOK + 1)); done
+[ "$SOK" -ge 1 ] && ok "user provisioned on $SOK/3 Sentinels (shared identity)" || bad "user on no Sentinel"
+
+OUT="$(podman exec vk-sentinel1 valkey-cli -p 26379 --user "$SUSER" --pass "$SPASS" --no-auth-warning SENTINEL get-master-addr-by-name mymaster 2>&1 | tr '\n' ' ')"
+echo "$OUT" | grep -qiE 'noperm|noauth|wrongpass' && bad "shared user cannot discover via Sentinel: $OUT" || ok "shared user discovers the master via Sentinel with its own credential: $OUT"
+OUT="$(podman exec vk-sentinel1 valkey-cli -p 26379 --user "$SUSER" --pass "$SPASS" --no-auth-warning SENTINEL failover mymaster 2>&1)"
+echo "$OUT" | grep -qi noperm && ok "shared user DENIED 'SENTINEL failover' (NOPERM)" || bad "shared user not denied failover: $OUT"
+
+vault lease revoke -prefix database/creds/shared-app >/dev/null 2>&1
+sleep 2
+for n in primary replica1 replica2; do node_has_user "$n" "$SUSER" && bad "data node $n still has user after revoke" || ok "data node $n cleaned"; done
+SGONE=1; for s in sentinel1 sentinel2 sentinel3; do sent_has_user "$s" "$SUSER" && SGONE=0; done
+[ "$SGONE" = 1 ] && ok "user removed from all Sentinels after revoke" || bad "user lingers on a Sentinel after revoke"
+
+echo "=== 11. root rotation (vault rotate-root), then verify issuance still works ==="
 # Rotates the plugin's vaultadmin password on every node (all-or-nothing). Sentinel uses
 # the separate 'default' identity, so its monitoring is unaffected. Success of a fresh
 # issuance proves the admin password is consistent across all nodes post-rotation.
+# Done LAST: it changes vaultadmin's password, which would invalidate a later connection
+# config still using the original password.
 vault write -f database/rotate-root/valkey >/dev/null 2>&1 && ok "rotate-root succeeded" || bad "rotate-root failed"
 if vault read -format=json database/creds/app >/dev/null 2>&1; then ok "issuance works after root rotation (admin consistent on every node)"; else bad "issuance broke after root rotation"; fi
 
 echo
-[ "$FAIL" = 0 ] && printf '\033[32mE2E PASS — Vault→plugin→Valkey full lifecycle verified\033[0m\n' || printf '\033[31mE2E FAIL\033[0m\n'
+[ "$FAIL" = 0 ] && printf '\033[32mE2E PASS — Vault→plugin→Valkey full lifecycle + shared-identity verified\033[0m\n' || printf '\033[31mE2E FAIL\033[0m\n'
 exit $FAIL

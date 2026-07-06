@@ -34,6 +34,9 @@ func (c *Config) discoverTopology(ctx context.Context) (*Topology, error) {
 			errs = append(errs, fmt.Sprintf("%s: %v", s, err))
 			continue
 		}
+		if c.sharedSentinelIdentity() {
+			topo.Sentinels = append([]string(nil), c.Sentinels...)
+		}
 		return topo, nil
 	}
 	return nil, fmt.Errorf("no Sentinel could resolve master %q: %s", c.SentinelMasterName, strings.Join(errs, "; "))

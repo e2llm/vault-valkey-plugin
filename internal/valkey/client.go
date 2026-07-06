@@ -70,3 +70,24 @@ func (c *Config) sentinelClient(addr string) (*redis.SentinelClient, error) {
 		DialTimeout: dialTimeout,
 	}), nil
 }
+
+// sentinelAdminClient connects to a single Sentinel as a regular client (not a
+// SentinelClient) using the Sentinel identity, so the plugin can run ACL SETUSER/
+// DELUSER on the Sentinel in shared-identity mode. The Sentinel identity must have
+// ACL-admin rights on the Sentinels for these to succeed.
+func (c *Config) sentinelAdminClient(addr string) (*redis.Client, error) {
+	tc, err := c.tlsConfig()
+	if err != nil {
+		return nil, err
+	}
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Username:     c.SentinelUsername,
+		Password:     c.SentinelPassword,
+		TLSConfig:    tc,
+		DialTimeout:  dialTimeout,
+		ReadTimeout:  dialTimeout,
+		WriteTimeout: dialTimeout,
+		MaxRetries:   2,
+	}), nil
+}

@@ -9,8 +9,13 @@
 # Key finding it encodes: ACL users are NODE-LOCAL. Data writes replicate; ACL
 # SETUSER/DELUSER do NOT, and a replica resync does not carry them either. So the
 # plugin must create/persist/delete the user on EVERY node and re-resolve the
-# master (via Sentinel) on every operation. The phases below prove that and then
-# validate the node-local design across a real failover.
+# master (via Sentinel) on every operation. INV-1..5 prove that and validate the
+# node-local design across a real failover.
+#
+# INV-6..8 cover the shared-identity (1.1.0) facts on the SENTINELS themselves: a
+# narrow runtime ACL user can resolve the master but NOT trigger failover; a Sentinel
+# has no CONFIG REWRITE (so a runtime user is ephemeral by default); and an
+# aclfile-configured Sentinel makes it durable via ACL SAVE.
 set -uo pipefail
 
 IMG="${VALKEY_IMAGE:-docker.io/valkey/valkey:8}"
@@ -45,7 +50,7 @@ create_on_all() { local n; for n in "${NODES[@]}"; do
 delete_on_all() { local n; for n in "${NODES[@]}"; do
   nacl "$n" ACL DELUSER "$1" >/dev/null; nacl "$n" ACL SAVE >/dev/null; done; }
 
-cleanup() { local n; for n in "${NODES[@]}" "${SENTINELS[@]}"; do podman rm -f "vk-$n" >/dev/null 2>&1; done; podman network rm "$NET" >/dev/null 2>&1; }
+cleanup() { local n; for n in "${NODES[@]}" "${SENTINELS[@]}"; do podman rm -f "vk-$n" >/dev/null 2>&1; done; podman rm -f vk-saclf >/dev/null 2>&1; podman network rm "$NET" >/dev/null 2>&1; }
 
 gen_configs() {
   rm -rf "$WORK"; mkdir -p "$WORK"
@@ -157,6 +162,58 @@ gone=1; for n in "${NODES[@]}"; do has_user "$n" app1 && { gone=0; bad "app1 lin
 [ "$gone" = 1 ] && ok "app1 removed from all nodes"
 
 #############################################################################
+log "INV-6  Sentinel ACL: a hashed discovery user resolves the master but CANNOT failover"
+sapp=sentinel1
+DHASH="#$(printf '%s' discopass | sha256sum | cut -d' ' -f1)"   # plugin provisions hashed by default
+sacl "$sapp" ACL SETUSER disco reset on "$DHASH" '+@connection' '+sentinel|get-master-addr-by-name' '+sentinel|replicas' '+sentinel|sentinels' >/dev/null
+sacl "$sapp" ACL LIST | grep -q '^user disco ' && ok "sentinel accepts a runtime ACL SETUSER (hashed password)" || bad "sentinel rejected ACL SETUSER"
+OUT=$(podman exec "vk-$sapp" valkey-cli -p 26379 --user disco --pass discopass --no-auth-warning SENTINEL get-master-addr-by-name mymaster 2>&1 | tr '\n' ' ')
+echo "$OUT" | grep -qiE 'noperm|noauth|wrongpass' && bad "discovery denied for disco: $OUT" || ok "disco (hashed pw) CAN get-master-addr-by-name: $OUT"
+OUT=$(podman exec "vk-$sapp" valkey-cli -p 26379 --user disco --pass discopass --no-auth-warning SENTINEL failover mymaster 2>&1)
+echo "$OUT" | grep -qi noperm && ok "disco DENIED 'SENTINEL failover' (NOPERM) — the narrow ACL contains the app" || bad "disco NOT denied failover: $OUT"
+
+#############################################################################
+log "INV-7  Sentinel persistence: no CONFIG REWRITE; ACL SAVE needs an aclfile (else ephemeral)"
+OUT=$(sacl "$sapp" CONFIG REWRITE 2>&1)
+echo "$OUT" | grep -qi 'unknown command' && ok "CONFIG REWRITE is unavailable on a Sentinel (so persistence_mode=rewrite is impossible)" || note "CONFIG REWRITE -> $OUT"
+OUT=$(sacl "$sapp" ACL SAVE 2>&1)
+echo "$OUT" | grep -qi 'not configured to use an ACL file' && ok "ACL SAVE without an aclfile errors -> runtime Sentinel users are ephemeral by default" || note "ACL SAVE -> $OUT"
+
+#############################################################################
+log "INV-8  Durable Sentinel ACL via aclfile: ACL SAVE survives restart; unsaved does not"
+m_ip=$(master_ip)
+mkdir -p "$WORK/saclf"
+printf 'user default on nopass ~* &* +@all\n' > "$WORK/saclf/users.acl"
+cat > "$WORK/saclf/node.conf" <<EOF
+bind 0.0.0.0
+protected-mode no
+port 26379
+dir /data
+aclfile /data/users.acl
+sentinel resolve-hostnames yes
+sentinel announce-ip 10.111.0.24
+sentinel monitor mymaster $m_ip 6379 1
+sentinel auth-user mymaster default
+sentinel auth-pass mymaster $PASS
+sentinel down-after-milliseconds mymaster 5000
+EOF
+chmod -R 0777 "$WORK/saclf"
+podman run -d --name vk-saclf --network "$NET" --ip 10.111.0.24 -v "$WORK/saclf:/data:Z" "$IMG" valkey-server /data/node.conf --sentinel >/dev/null
+for _ in $(seq 1 15); do podman exec vk-saclf valkey-cli -p 26379 PING >/dev/null 2>&1 && break; sleep 1; done
+if podman exec vk-saclf valkey-cli -p 26379 PING >/dev/null 2>&1; then
+  ok "aclfile-configured Sentinel started (the directive IS honored in sentinel mode)"
+  podman exec vk-saclf valkey-cli -p 26379 ACL SETUSER durable reset on '>x' '+@connection' '+sentinel|get-master-addr-by-name' >/dev/null
+  podman exec vk-saclf valkey-cli -p 26379 ACL SAVE >/dev/null
+  podman exec vk-saclf valkey-cli -p 26379 ACL SETUSER ephem reset on '>x' '+@connection' >/dev/null   # deliberately NOT saved
+  podman restart vk-saclf >/dev/null; sleep 5
+  for _ in $(seq 1 15); do podman exec vk-saclf valkey-cli -p 26379 PING >/dev/null 2>&1 && break; sleep 1; done
+  podman exec vk-saclf valkey-cli -p 26379 ACL LIST | grep -q '^user durable ' && ok "saved 'durable' survived restart — aclfile + ACL SAVE is the durable path" || bad "saved 'durable' lost after restart"
+  podman exec vk-saclf valkey-cli -p 26379 ACL LIST | grep -q '^user ephem ' && bad "unsaved 'ephem' survived restart" || ok "unsaved 'ephem' lost on restart — Sentinel persistence is explicit (aclfile + ACL SAVE)"
+else
+  bad "aclfile-configured Sentinel did not start (the directive may be rejected on $IMG)"
+fi
+
+#############################################################################
 log "SUMMARY for $IMG"
-[ "$FAILED" = 0 ] && printf '  \033[32mALL INVARIANTS HELD (node-local design validated)\033[0m\n' || printf '  \033[31mSOME INVARIANTS FAILED — see above\033[0m\n'
+[ "$FAILED" = 0 ] && printf '  \033[32mALL INVARIANTS HELD (node-local + shared-identity Sentinel design validated)\033[0m\n' || printf '  \033[31mSOME INVARIANTS FAILED — see above\033[0m\n'
 exit $FAILED

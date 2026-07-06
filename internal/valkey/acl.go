@@ -125,3 +125,50 @@ func overBroad(rules string) []string {
 	}
 	return hits
 }
+
+// defaultSentinelRules is the built-in narrow discovery ACL for the shared-identity
+// Sentinel user: connection commands plus the read-only SENTINEL subcommands a client
+// needs to resolve the master. It deliberately omits the mutating subcommands
+// (failover/monitor/remove/set), so a leaked app credential cannot drive the topology.
+// Validated sufficient + contained in test/sentinel/spike.sh.
+const defaultSentinelRules = "+@connection +sentinel|get-master-addr-by-name +sentinel|replicas +sentinel|sentinels"
+
+// sentinelRules returns the Sentinel-side discovery ACL: the operator override if set,
+// otherwise the built-in narrow default.
+func (c *Config) sentinelRules() string {
+	if r := strings.TrimSpace(c.SentinelCreationStatements); r != "" {
+		return r
+	}
+	return defaultSentinelRules
+}
+
+// sentinelMutatingSubs are SENTINEL subcommands that change topology/monitoring; a
+// discovery user (the app's shared identity) must never hold these.
+var sentinelMutatingSubs = map[string]bool{
+	"failover": true, "monitor": true, "remove": true, "set": true,
+	"reset": true, "simulate-failure": true, "debug": true, "flushconfig": true,
+}
+
+// validateSentinelRules applies the same credential-model checks as the data side
+// (no model-breaking tokens, no password directives, no privilege escalation) and
+// additionally forbids granting topology control: the whole `sentinel` command, or any
+// mutating `sentinel|<sub>`.
+func validateSentinelRules(rules string) error {
+	if err := validateRules(rules); err != nil {
+		return err
+	}
+	for _, raw := range strings.Fields(rules) {
+		tok := strings.Trim(raw, "()")
+		if tok == "" || tok[0] != '+' {
+			continue
+		}
+		low := strings.ToLower(tok[1:])
+		if low == "sentinel" {
+			return fmt.Errorf("sentinel_creation_statements may not grant the whole 'sentinel' command (%q): it includes failover/monitor/remove — grant only read subcommands, e.g. +sentinel|get-master-addr-by-name", raw)
+		}
+		if i := strings.IndexByte(low, '|'); i >= 0 && low[:i] == "sentinel" && sentinelMutatingSubs[low[i+1:]] {
+			return fmt.Errorf("sentinel_creation_statements may not grant the mutating subcommand %q: a discovery user must not control failover/monitoring", raw)
+		}
+	}
+	return nil
+}

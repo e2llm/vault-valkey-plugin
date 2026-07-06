@@ -19,10 +19,26 @@ type nodeACL interface {
 }
 
 // redisNodeACL is the production nodeACL: short-lived go-redis client per call,
-// ACL command, then per-node persistence.
+// ACL command, then per-node persistence. It is parametrized by how it connects
+// (data node admin vs Sentinel admin) and how it persists, so one implementation
+// serves both planes.
 type redisNodeACL struct {
-	cfg *Config
-	log hclog.Logger
+	cfg         *Config // for credToken (password hashing)
+	log         hclog.Logger
+	connect     func(addr string) (*redis.Client, error) // node admin vs Sentinel admin
+	persistMode string                                   // persistence mode for this plane
+}
+
+// dataNodeACL applies ACL ops to the Valkey data nodes as the node admin identity.
+func (cfg *Config) dataNodeACL(log hclog.Logger) redisNodeACL {
+	return redisNodeACL{cfg: cfg, log: log, connect: cfg.nodeClient, persistMode: cfg.PersistenceMode}
+}
+
+// sentinelNodeACL applies ACL ops to the Sentinels as the Sentinel admin identity
+// (shared-identity mode). Sentinels have no CONFIG REWRITE, so persistence is aclfile
+// (ACL SAVE) or none.
+func (cfg *Config) sentinelNodeACL(log hclog.Logger) redisNodeACL {
+	return redisNodeACL{cfg: cfg, log: log, connect: cfg.sentinelAdminClient, persistMode: cfg.SentinelPersistenceMode}
 }
 
 // createUser provisions a deterministic, clean user:
@@ -57,7 +73,7 @@ func (r redisNodeACL) deleteUser(ctx context.Context, node, username string) err
 }
 
 func (r redisNodeACL) do(ctx context.Context, node, op string, fn func(*redis.Client) error) error {
-	client, err := r.cfg.nodeClient(node)
+	client, err := r.connect(node)
 	if err != nil {
 		return err
 	}
@@ -66,7 +82,7 @@ func (r redisNodeACL) do(ctx context.Context, node, op string, fn func(*redis.Cl
 	if err := fn(client); err != nil {
 		return fmt.Errorf("ACL %s on %s: %w", op, node, err)
 	}
-	if err := persist(ctx, client, r.cfg.PersistenceMode); err != nil {
+	if err := persist(ctx, client, r.persistMode); err != nil {
 		return fmt.Errorf("persist after %s on %s: %w", op, node, err)
 	}
 	if r.log != nil {

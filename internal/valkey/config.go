@@ -21,6 +21,20 @@ const (
 	PersistenceNone = "none"
 )
 
+// Sentinel identity modes control whether the dynamic user is also provisioned onto
+// the Sentinels (for legacy apps that authenticate to both the data nodes and the
+// Sentinels with ONE credential), or whether Sentinel discovery uses a separate
+// identity (the secure default).
+const (
+	// IdentitySeparate (default) keeps dynamic users on the data nodes only;
+	// discovery uses the operator-provisioned sentinel_username/password.
+	IdentitySeparate = "separate"
+	// IdentityShared also provisions the dynamic user onto the Sentinels with a
+	// narrow read-only discovery ACL. Less secure (the app credential reaches the
+	// Sentinel control plane) — opt-in for clients that cannot use two identities.
+	IdentityShared = "shared"
+)
+
 // Config is the parsed connection configuration for a Valkey database backend.
 type Config struct {
 	// Sentinel discovery (preferred). When Sentinels is non-empty the plugin
@@ -56,6 +70,18 @@ type Config struct {
 
 	// UsernameTemplate overrides the generated dynamic username format.
 	UsernameTemplate string
+
+	// SentinelIdentityMode selects "separate" (default) or "shared" (see Identity*
+	// constants). In shared mode the dynamic user is also provisioned on the
+	// Sentinels, and sentinel_username/password must be a Sentinel admin.
+	SentinelIdentityMode string
+	// SentinelPersistenceMode is the durability of the Sentinel-side user in shared
+	// mode: "aclfile" (ACL SAVE — requires an aclfile configured on the Sentinels) or
+	// "none" (ephemeral, default). CONFIG REWRITE is unavailable on Sentinels.
+	SentinelPersistenceMode string
+	// SentinelCreationStatements overrides the Sentinel-side discovery ACL in shared
+	// mode. Empty uses the built-in narrow read-only default (see sentinelRules).
+	SentinelCreationStatements string
 }
 
 func parseConfig(raw map[string]interface{}) (Config, error) {
@@ -76,9 +102,19 @@ func parseConfig(raw map[string]interface{}) (Config, error) {
 		TLSKey:             cfgString(raw, "tls_key"),
 		PasswordHashing:    cfgBoolDefault(raw, "password_hashing", true),
 		UsernameTemplate:   cfgString(raw, "username_template"),
+
+		SentinelIdentityMode:       strings.ToLower(cfgString(raw, "sentinel_identity_mode")),
+		SentinelPersistenceMode:    strings.ToLower(cfgString(raw, "sentinel_persistence_mode")),
+		SentinelCreationStatements: cfgString(raw, "sentinel_creation_statements"),
 	}
 	if c.PersistenceMode == "" {
 		c.PersistenceMode = PersistenceACLFile
+	}
+	if c.SentinelIdentityMode == "" {
+		c.SentinelIdentityMode = IdentitySeparate
+	}
+	if c.SentinelPersistenceMode == "" {
+		c.SentinelPersistenceMode = PersistenceNone
 	}
 	if err := c.validate(); err != nil {
 		return Config{}, err
@@ -105,8 +141,34 @@ func (c *Config) validate() error {
 	if c.TLSCert != "" && c.TLSKey == "" || c.TLSCert == "" && c.TLSKey != "" {
 		return errors.New("tls_cert and tls_key must be supplied together")
 	}
+	switch c.SentinelIdentityMode {
+	case IdentitySeparate, IdentityShared:
+	default:
+		return fmt.Errorf("invalid sentinel_identity_mode %q (want one of: separate, shared)", c.SentinelIdentityMode)
+	}
+	// A Sentinel has no CONFIG REWRITE (proven in test/sentinel/spike.sh), so the
+	// Sentinel-side user can only be persisted via an aclfile, or left ephemeral.
+	switch c.SentinelPersistenceMode {
+	case PersistenceACLFile, PersistenceNone:
+	case PersistenceRewrite:
+		return errors.New("sentinel_persistence_mode=rewrite is impossible: Sentinels have no CONFIG REWRITE — use aclfile (requires an aclfile configured on the Sentinels) or none (ephemeral)")
+	default:
+		return fmt.Errorf("invalid sentinel_persistence_mode %q (want one of: aclfile, none)", c.SentinelPersistenceMode)
+	}
+	if c.SentinelIdentityMode == IdentityShared {
+		if !sentinelMode {
+			return errors.New("sentinel_identity_mode=shared requires Sentinel mode (set sentinels + sentinel_master_name); it is meaningless for a standalone host")
+		}
+		if err := validateSentinelRules(c.sentinelRules()); err != nil {
+			return err
+		}
+	}
 	return nil
 }
+
+// sharedSentinelIdentity reports whether the dynamic user must also be provisioned
+// onto the Sentinels (shared-identity mode).
+func (c *Config) sharedSentinelIdentity() bool { return c.SentinelIdentityMode == IdentityShared }
 
 // --- defensive config decoding (Vault passes everything as map[string]interface{}) ---
 

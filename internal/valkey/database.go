@@ -83,13 +83,21 @@ func (v *valkeyDB) Initialize(ctx context.Context, req dbplugin.InitializeReques
 	if len(cfg.Sentinels) > 0 {
 		mode = "sentinel"
 	}
-	v.logger.Info("initializing", "mode", mode, "master_name", cfg.SentinelMasterName,
-		"persistence_mode", cfg.PersistenceMode, "tls", cfg.TLS, "password_hashing", cfg.PasswordHashing)
+	v.logger.Info("initializing", "mode", mode, "sentinel_identity_mode", cfg.SentinelIdentityMode,
+		"master_name", cfg.SentinelMasterName, "persistence_mode", cfg.PersistenceMode,
+		"tls", cfg.TLS, "password_hashing", cfg.PasswordHashing)
 	if !cfg.TLS {
 		v.logger.Warn("TLS disabled: the node admin password and client AUTH traffic travel in cleartext — enable `tls` for any non-trusted network")
 	}
 	if cfg.InsecureTLS {
 		v.logger.Warn("insecure_tls set: server certificate verification is disabled")
+	}
+	if cfg.sharedSentinelIdentity() {
+		v.logger.Warn("sentinel_identity_mode=shared: the dynamic user is provisioned onto the Sentinels too, so the app credential reaches the Sentinel control plane (read-only discovery). Less secure than separate identities — use only for clients that cannot use a dedicated Sentinel discovery user",
+			"sentinel_persistence_mode", cfg.SentinelPersistenceMode)
+		if cfg.SentinelPersistenceMode == PersistenceNone {
+			v.logger.Info("Sentinel-side users are ephemeral (sentinel_persistence_mode=none): they do not survive a Sentinel restart; correctness relies on multiple Sentinels and the app re-fetching credentials")
+		}
 	}
 
 	if req.VerifyConnection {
@@ -139,11 +147,33 @@ func (v *valkeyDB) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (db
 		return dbplugin.NewUserResponse{}, fmt.Errorf("topology discovery failed: %w", err)
 	}
 
-	ops := redisNodeACL{cfg: &cfg, log: v.logger}
-	if err := topo.create(ctx, ops, username, req.Password, rules); err != nil {
+	dataOps := cfg.dataNodeACL(v.logger)
+	if err := topo.create(ctx, dataOps, username, req.Password, rules); err != nil {
 		v.logger.Error("create user failed", "user", username, "error", err)
 		return dbplugin.NewUserResponse{}, err
 	}
+
+	// Shared-identity mode: also provision the user on the Sentinels so the app can
+	// discover the master with the same credential. Quorum of one; total failure rolls
+	// back the data plane so Vault never holds a lease whose credential is unusable.
+	if len(topo.Sentinels) > 0 {
+		sentinelOps := cfg.sentinelNodeACL(v.logger)
+		done, failed, serr := topo.createSentinels(ctx, sentinelOps, username, req.Password, cfg.sentinelRules())
+		if serr != nil {
+			if rb := topo.delete(ctx, dataOps, username); rb != nil {
+				v.logger.Error("rolled back data nodes after total Sentinel failure, but rollback had errors", "error", rb)
+			}
+			v.logger.Error("create user failed: no Sentinel accepted the discovery user", "user", username, "error", serr)
+			return dbplugin.NewUserResponse{}, serr
+		}
+		for _, f := range failed {
+			v.logger.Warn("Sentinel provisioning failed (tolerated — another Sentinel succeeded)",
+				"detail", f, "role", req.UsernameConfig.RoleName)
+		}
+		v.logger.Info("provisioned discovery user on Sentinels", "user", username,
+			"sentinels_ok", len(done), "sentinels_failed", len(failed))
+	}
+
 	v.logger.Info("created user", "user", username, "role", req.UsernameConfig.RoleName,
 		"nodes", len(topo.Nodes), "master", topo.Master)
 	return dbplugin.NewUserResponse{Username: username}, nil
@@ -179,9 +209,17 @@ func (v *valkeyDB) UpdateUser(ctx context.Context, req dbplugin.UpdateUserReques
 		return dbplugin.UpdateUserResponse{}, nil
 	}
 
-	ops := redisNodeACL{cfg: &cfg, log: v.logger}
-	if err := topo.setPassword(ctx, ops, req.Username, req.Password.NewPassword); err != nil {
+	dataOps := cfg.dataNodeACL(v.logger)
+	if err := topo.setPassword(ctx, dataOps, req.Username, req.Password.NewPassword); err != nil {
 		return dbplugin.UpdateUserResponse{}, err
+	}
+	if len(topo.Sentinels) > 0 {
+		sentinelOps := cfg.sentinelNodeACL(v.logger)
+		if err := setPasswordOn(ctx, sentinelOps, topo.Sentinels, req.Username, req.Password.NewPassword); err != nil {
+			// Best-effort: a stale Sentinel-side password only affects discovery, and the
+			// app re-fetches credentials on restart. Log, don't fail the rotation.
+			v.logger.Warn("Sentinel-side password update failed (best-effort)", "user", req.Username, "error", err)
+		}
 	}
 	v.logger.Info("updated user password", "user", req.Username, "nodes", len(topo.Nodes))
 	return dbplugin.UpdateUserResponse{}, nil
@@ -195,7 +233,7 @@ func (v *valkeyDB) UpdateUser(ctx context.Context, req dbplugin.UpdateUserReques
 func (v *valkeyDB) rotateRoot(ctx context.Context, cfg *Config, topo *Topology, newPass string) error {
 	oldPass := cfg.Password
 	user := cfg.Username
-	opsOld := redisNodeACL{cfg: cfg, log: v.logger} // connects with the current (old) password
+	opsOld := cfg.dataNodeACL(v.logger) // connects with the current (old) password
 
 	// restore brings a node back to oldPass whether it currently holds the new password
 	// (SETUSER applied but persist failed) or still the old one (change never applied):
@@ -204,7 +242,7 @@ func (v *valkeyDB) rotateRoot(ctx context.Context, cfg *Config, topo *Topology, 
 	restore := func(node string) error {
 		cfgNew := *cfg
 		cfgNew.Password = newPass
-		if err := (redisNodeACL{cfg: &cfgNew, log: v.logger}).setPassword(ctx, node, user, oldPass); err == nil {
+		if err := cfgNew.dataNodeACL(v.logger).setPassword(ctx, node, user, oldPass); err == nil {
 			return nil
 		}
 		return opsOld.setPassword(ctx, node, user, oldPass)
@@ -246,10 +284,17 @@ func (v *valkeyDB) DeleteUser(ctx context.Context, req dbplugin.DeleteUserReques
 		return dbplugin.DeleteUserResponse{}, fmt.Errorf("topology discovery failed: %w", err)
 	}
 
-	ops := redisNodeACL{cfg: &cfg, log: v.logger}
-	if err := topo.delete(ctx, ops, req.Username); err != nil {
+	dataOps := cfg.dataNodeACL(v.logger)
+	if err := topo.delete(ctx, dataOps, req.Username); err != nil {
 		v.logger.Error("delete user failed", "user", req.Username, "error", err)
 		return dbplugin.DeleteUserResponse{}, err
+	}
+	if len(topo.Sentinels) > 0 {
+		sentinelOps := cfg.sentinelNodeACL(v.logger)
+		for _, f := range topo.deleteSentinels(ctx, sentinelOps, req.Username) {
+			v.logger.Warn("Sentinel revoke failed (harmless: discovery-only access; ephemeral Sentinels self-clean on restart)",
+				"detail", f, "user", req.Username)
+		}
 	}
 	v.logger.Info("deleted user", "user", req.Username, "nodes", len(topo.Nodes))
 	return dbplugin.DeleteUserResponse{}, nil
