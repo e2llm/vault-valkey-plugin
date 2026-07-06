@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/); releases are cut by tagging `vX.Y.Z`
 (see `PUBLIC-RELEASE-CHECKLIST.md`). The release section becomes the GitHub release notes.
 
+## v1.2.0
+
+Opportunistic **reconcile pass** that heals node-local ACL drift — the honest limitation
+called out since v1.0.0. On each credential issuance (when replicas are present) the plugin
+converges every data node to the master, the source of truth:
+
+- a managed user **missing** from a data node that was down at an earlier create is
+  re-asserted from the master's definition — hash and all, via `ACL LIST` → `ACL SETUSER
+  reset` (never cleartext, no Vault lease enumeration);
+- a managed user a revoke left as an **orphan** on a then-down node is removed.
+- The master is authoritative by construction (every create writes it first, every op
+  re-resolves to it), so reconcile needs no external lease-aware reconciler and survives a
+  plugin restart — it closes that gap in-plugin.
+- `reconcile` = `true` (default) | `false`. Best-effort and non-fatal — a reconcile hiccup
+  never fails issuance. Cheap when clean: one `ACL LIST` on the master + one `ACL USERS`
+  per node; it writes only actual drift.
+- `managed_username_prefix` (default `v_`, the built-in `username_template` prefix)
+  identifies plugin-managed users, so static/admin accounts are never touched. Set it only
+  if `username_template` is overridden to a different prefix.
+
 ## v1.1.0
 
 Optional **shared Sentinel identity** mode for legacy apps that authenticate to both the

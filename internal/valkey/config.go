@@ -82,6 +82,15 @@ type Config struct {
 	// SentinelCreationStatements overrides the Sentinel-side discovery ACL in shared
 	// mode. Empty uses the built-in narrow read-only default (see sentinelRules).
 	SentinelCreationStatements string
+
+	// Reconcile enables the opportunistic reconcile pass on each NewUser: managed users
+	// missing from a returned data node are re-asserted from the master, and orphans a
+	// revoke left on a then-down node are removed. Default true.
+	Reconcile bool
+	// ManagedUsernamePrefix identifies plugin-managed dynamic users for the reconcile
+	// pass (default "v_", the built-in username_template prefix). Set this only if
+	// username_template is overridden to produce a different prefix.
+	ManagedUsernamePrefix string
 }
 
 func parseConfig(raw map[string]interface{}) (Config, error) {
@@ -106,6 +115,9 @@ func parseConfig(raw map[string]interface{}) (Config, error) {
 		SentinelIdentityMode:       strings.ToLower(cfgString(raw, "sentinel_identity_mode")),
 		SentinelPersistenceMode:    strings.ToLower(cfgString(raw, "sentinel_persistence_mode")),
 		SentinelCreationStatements: cfgString(raw, "sentinel_creation_statements"),
+
+		Reconcile:             cfgBoolDefault(raw, "reconcile", true),
+		ManagedUsernamePrefix: cfgString(raw, "managed_username_prefix"),
 	}
 	if c.PersistenceMode == "" {
 		c.PersistenceMode = PersistenceACLFile
@@ -115,6 +127,9 @@ func parseConfig(raw map[string]interface{}) (Config, error) {
 	}
 	if c.SentinelPersistenceMode == "" {
 		c.SentinelPersistenceMode = PersistenceNone
+	}
+	if c.ManagedUsernamePrefix == "" {
+		c.ManagedUsernamePrefix = defaultManagedUsernamePrefix
 	}
 	if err := c.validate(); err != nil {
 		return Config{}, err

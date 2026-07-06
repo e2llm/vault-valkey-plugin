@@ -174,6 +174,17 @@ func (v *valkeyDB) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (db
 			"sentinels_ok", len(done), "sentinels_failed", len(failed))
 	}
 
+	// Opportunistic reconcile: now that we're topology-resolved and admin-connected, re-assert
+	// any managed users a returned data node is missing (it was down at an earlier create) and
+	// clear orphans a revoke left on a then-down node. Best-effort — the issued credential is
+	// already provisioned, so a reconcile hiccup never fails issuance.
+	if cfg.Reconcile && len(topo.Nodes) > 1 {
+		if issues := topo.reconcile(ctx, dataOps, cfg.ManagedUsernamePrefix, cfg.Username); len(issues) > 0 {
+			v.logger.Warn("reconcile pass reported node drift (non-fatal; the issued credential is already provisioned)",
+				"issues", strings.Join(issues, "; "))
+		}
+	}
+
 	v.logger.Info("created user", "user", username, "role", req.UsernameConfig.RoleName,
 		"nodes", len(topo.Nodes), "master", topo.Master)
 	return dbplugin.NewUserResponse{Username: username}, nil

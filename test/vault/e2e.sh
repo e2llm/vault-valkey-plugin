@@ -127,7 +127,31 @@ for n in primary replica1 replica2; do node_has_user "$n" "$SUSER" && bad "data 
 SGONE=1; for s in sentinel1 sentinel2 sentinel3; do sent_has_user "$s" "$SUSER" && SGONE=0; done
 [ "$SGONE" = 1 ] && ok "user removed from all Sentinels after revoke" || bad "user lingers on a Sentinel after revoke"
 
-echo "=== 11. root rotation (vault rotate-root), then verify issuance still works ==="
+echo "=== 11. reconcile: a replica down at create is healed on the next issuance ==="
+# Stop replica2 and wait for Sentinel to mark it down, so the next issuance skips it.
+podman stop vk-replica2 >/dev/null 2>&1
+for _ in $(seq 1 15); do
+  podman exec vk-sentinel1 valkey-cli -p 26379 SENTINEL replicas mymaster 2>/dev/null | tr '\n' ' ' | grep -qE 's_down|disconnected' && break
+  sleep 1
+done
+R1="$(vault read -format=json database/creds/app | jq -r .data.username)"
+{ [ -n "$R1" ] && node_has_user primary "$R1" && node_has_user replica1 "$R1"; } && ok "R1 ($R1) issued onto the up nodes while replica2 was down" || bad "R1 issue/placement failed"
+# Bring replica2 back and wait for it to rejoin as a healthy replica.
+podman start vk-replica2 >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  reps="$(podman exec vk-sentinel1 valkey-cli -p 26379 SENTINEL replicas mymaster 2>/dev/null | tr '\n' ' ')"
+  echo "$reps" | grep -q '10.111.0.12' && ! echo "$reps" | grep -qE 's_down|disconnected' && break
+  sleep 1
+done
+node_has_user replica2 "$R1" && bad "precondition wrong: returned replica2 already has R1" || ok "gap confirmed — returned replica2 lacks R1 (it was down at R1's create)"
+# The next issuance (R2) runs the reconcile pass, which converges replica2 to the master.
+R2="$(vault read -format=json database/creds/app | jq -r .data.username)"
+sleep 1
+node_has_user replica2 "$R1" && ok "reconcile healed replica2 — R1 re-asserted from the master" || bad "reconcile did not re-assert R1 on replica2"
+for n in primary replica1 replica2; do node_has_user "$n" "$R2" && ok "R2 present on $n" || bad "R2 missing on $n"; done
+vault lease revoke -prefix database/creds/app >/dev/null 2>&1
+
+echo "=== 12. root rotation (vault rotate-root), then verify issuance still works ==="
 # Rotates the plugin's vaultadmin password on every node (all-or-nothing). Sentinel uses
 # the separate 'default' identity, so its monitoring is unaffected. Success of a fresh
 # issuance proves the admin password is consistent across all nodes post-rotation.
@@ -137,5 +161,5 @@ vault write -f database/rotate-root/valkey >/dev/null 2>&1 && ok "rotate-root su
 if vault read -format=json database/creds/app >/dev/null 2>&1; then ok "issuance works after root rotation (admin consistent on every node)"; else bad "issuance broke after root rotation"; fi
 
 echo
-[ "$FAIL" = 0 ] && printf '\033[32mE2E PASS — Vault→plugin→Valkey full lifecycle + shared-identity verified\033[0m\n' || printf '\033[31mE2E FAIL\033[0m\n'
+[ "$FAIL" = 0 ] && printf '\033[32mE2E PASS — Vault→plugin→Valkey full lifecycle + shared-identity + reconcile verified\033[0m\n' || printf '\033[31mE2E FAIL\033[0m\n'
 exit $FAIL

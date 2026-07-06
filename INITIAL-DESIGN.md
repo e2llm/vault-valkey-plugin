@@ -140,15 +140,31 @@ Separate identities remain the default and the more secure model.
 - **Partial create** → rollback (delete on succeeded nodes), surface both the original
   and any rollback errors.
 - **Sentinel unreachable** → try the next; only fail if *all* are unreachable.
-- **Down replica** → excluded from the node set (won't receive writes; it will be
-  re-provisioned on a later operation once healthy, or simply never serves traffic).
+- **Down replica** → excluded from the node set (won't receive writes); the reconcile pass
+  (§8.1) re-provisions it from the master on a later issuance once it is healthy again.
 - **Revoke after failover** → topology is re-resolved, so DELUSER targets the current
   primary and the live replicas.
 
-Known edge to harden (see `docs/plan.md` test matrix): a replica that is down at
-create time and returns later will lack the user until the next operation touches it.
-A reconciliation pass (re-assert active leases across the current node set) is the
-planned mitigation.
+### 8.1 Reconcile pass
+
+Node-locality leaves two drifts the per-operation logic cannot see on its own: a replica
+**down at create-time** never got the user, and a node **down at revoke-time** keeps a stale
+one. The reconcile pass heals both. On each `NewUser` (when replicas are present, unless
+`reconcile=false`) the plugin converges every data node to the **master** — authoritative by
+construction, since every create writes it first and every op re-resolves to it:
+
+- a managed user on the master but **missing** from a node is cloned from the master's
+  `ACL LIST` line via `ACL SETUSER <u> reset <rules>` — the line already carries `#<hash>`,
+  so no cleartext leaves the master and no Vault lease lookup is needed;
+- a managed user on a node but **absent** from the master is deleted as an orphan.
+
+Managed users are identified by `managed_username_prefix` (default `v_`, the template
+prefix); the node admin and `default` are never touched. It is best-effort and non-fatal
+(the issued credential is already provisioned) and cheap when clean — one `ACL LIST` on the
+master plus one `ACL USERS` per node, writing only actual drift. Because the master is the
+source of truth, this needs **no external lease-aware reconciler** and survives a plugin
+restart. Sentinel-side reconcile (shared mode) is not yet included — Sentinels are stable
+and their users self-clean when ephemeral.
 
 ## 9. Compatibility
 

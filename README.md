@@ -8,7 +8,7 @@ issues **dynamic Valkey credentials** across a **Sentinel-managed** primary/repl
 topology — including correct behaviour across failover — and supports a **separate,
 low-privilege identity for Sentinel discovery**.
 
-> Status: **released (v1.1.0).** Production-hardened — unit, live-cluster integration,
+> Status: **released (v1.2.0).** Production-hardened — unit, live-cluster integration,
 > and real-Vault end-to-end tests pass on Vault 1.14 and 1.21; see `CHANGELOG.md`.
 
 ## Why a dedicated plugin
@@ -74,6 +74,8 @@ vault read database/creds/app-reader
 | `sentinel_identity_mode` | no | `separate` (default) or `shared` — see [Shared identity](#shared-identity) |
 | `sentinel_persistence_mode` | no | Sentinel-side durability in `shared` mode: `none` (default, ephemeral) or `aclfile`. `rewrite` is rejected (Sentinels have no `CONFIG REWRITE`) |
 | `sentinel_creation_statements` | no | Override the Sentinel-side discovery ACL (`shared` mode); default is a narrow read-only set |
+| `reconcile` | no | Heal node-local ACL drift on each issuance (default `true`) — re-assert managed users a returned node is missing, remove orphans a revoke left behind. See [Reconciliation](#reconciliation) |
+| `managed_username_prefix` | no | Prefix identifying plugin-managed users for reconcile (default `v_`); set only if `username_template` uses a different prefix |
 
 ## Shared identity
 
@@ -103,6 +105,23 @@ vault write database/config/my-valkey \
   stable and the app re-fetches credentials on restart.
 - Shared identity is **less secure** than separate identities (the app credential reaches
   the Sentinel control plane). Prefer separate identities where the client supports them.
+
+## Reconciliation
+
+Because ACL users are node-local, a replica that is **down when a credential is created**
+never receives that user, and a node **down when a lease is revoked** keeps a stale one.
+The plugin heals both on each subsequent issuance (`reconcile=true`, the default): it treats
+the **master** as the source of truth — every create writes the master first and every
+operation re-resolves to it — and converges each data node to it.
+
+- A managed user present on the master but missing from a node is **cloned** from the
+  master's `ACL LIST` definition (hash included, so no cleartext and no Vault lookup).
+- A managed user on a node but absent from the master is **removed** as an orphan.
+- Best-effort and non-fatal — the just-issued credential is already provisioned, so a
+  reconcile hiccup only logs. Cheap when clean (one `ACL LIST` + one `ACL USERS` per node).
+
+Managed users are identified by `managed_username_prefix` (default `v_`); static and admin
+accounts are never touched. Set `reconcile=false` to disable.
 
 ## Compatibility
 

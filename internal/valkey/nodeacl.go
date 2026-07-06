@@ -90,3 +90,66 @@ func (r redisNodeACL) do(ctx context.Context, node, op string, fn func(*redis.Cl
 	}
 	return nil
 }
+
+// listUserDefs returns every ACL user on the node with its full rule string (ACL LIST) —
+// the reconcile source of truth, from which a user can be cloned verbatim (hash included).
+func (r redisNodeACL) listUserDefs(ctx context.Context, node string) ([]aclUserDef, error) {
+	var defs []aclUserDef
+	err := r.read(ctx, node, "list", func(c *redis.Client) error {
+		lines, e := c.Do(ctx, "ACL", "LIST").StringSlice()
+		if e != nil {
+			return e
+		}
+		for _, ln := range lines {
+			if name, rules, ok := parseACLListLine(ln); ok {
+				defs = append(defs, aclUserDef{Name: name, Rules: rules})
+			}
+		}
+		return nil
+	})
+	return defs, err
+}
+
+// listUsernames returns just the set of usernames on the node (ACL USERS) — the cheap read
+// the reconcile pass runs per target node to diff against the master's managed set.
+func (r redisNodeACL) listUsernames(ctx context.Context, node string) (map[string]struct{}, error) {
+	set := map[string]struct{}{}
+	err := r.read(ctx, node, "users", func(c *redis.Client) error {
+		names, e := c.Do(ctx, "ACL", "USERS").StringSlice()
+		if e != nil {
+			return e
+		}
+		for _, n := range names {
+			set[n] = struct{}{}
+		}
+		return nil
+	})
+	return set, err
+}
+
+// applyUserDef clones a user onto a node from its master rule string:
+//
+//	ACL SETUSER <user> reset <rules...>
+//
+// The rules already carry "on #hash …" (from ACL LIST), so no credToken is added — the
+// copied hash authenticates the same cleartext password Vault issued. Persisted per plane.
+func (r redisNodeACL) applyUserDef(ctx context.Context, node, username, rules string) error {
+	return r.do(ctx, node, "reconcile", func(c *redis.Client) error {
+		args := []interface{}{"ACL", "SETUSER", username, "reset"}
+		args = append(args, ruleArgs(rules)...)
+		return c.Do(ctx, args...).Err()
+	})
+}
+
+// read runs a read-only ACL query (no persistence step) against one node.
+func (r redisNodeACL) read(ctx context.Context, node, op string, fn func(*redis.Client) error) error {
+	client, err := r.connect(node)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+	if err := fn(client); err != nil {
+		return fmt.Errorf("ACL %s on %s: %w", op, node, err)
+	}
+	return nil
+}
