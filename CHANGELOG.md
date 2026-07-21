@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/); releases are cut by tagging `vX.Y.Z`
 (see `PUBLIC-RELEASE-CHECKLIST.md`). The release section becomes the GitHub release notes.
 
+## v1.3.0
+
+**Static roles** — Vault-managed rotation of a pre-existing *shared* credential (one account
+used by many clients), alongside the dynamic per-lease creds. Rotation flows through the
+plugin's `UpdateUser` and is applied across **every** Sentinel node, so whichever node a
+client reaches — including a promoted replica — carries the current password.
+
+- Configure a Vault static role against an existing Valkey user:
+  `vault write database/static-roles/<name> db_name=<conn> username=<user> rotation_period=<dur>`
+  (or `rotation_schedule` for calendar-aligned rotation). `vault read database/static-creds/<name>`
+  returns the current shared password to every reader, plus the time to the next rotation.
+- The static user must be **pre-provisioned with its ACL rules on every node** (Vault rotates,
+  it does not create). Name it with `managed_username_prefix` (default `v_`) so the reconcile
+  pass keeps it converged across the topology; a non-root rotation now runs reconcile too.
+- **`contrib/lazy-rotate.sh`** — optional restart-coupled ("lazy") wrapper: at pod start it
+  returns the current shared password, first rotating it only if older than `MAX_AGE`. Pair
+  with `rotation_period` for a hard compliance ceiling (see the script header for the trade-off).
+- Honest limitation: a node **down during a rotation** stays stale until the next rotation (or
+  a reconcile triggered by other issuance) re-converges it — fine when nodes are healthy at
+  rotation time; frequent rotation or live dynamic traffic tightens the window.
+
 ## v1.2.0
 
 Opportunistic **reconcile pass** that heals node-local ACL drift — the honest limitation

@@ -72,12 +72,15 @@ NewUser/UpdateUser/DeleteUser
   persist. `reset` makes the user deterministic; `#<sha256>` keeps the cleartext off the
   node's command log/SLOWLOG (clients still auth with the cleartext Vault issued).
   **Partial failure rolls back** the nodes already done.
-- **UpdateUser** — password change. The dominant caller is **root rotation**
-  (`vault rotate-root`), arriving as `UpdateUser` on the configured root user: the plugin
-  rotates the admin password on every node **all-or-nothing** — if any node fails it
-  restores the old password on the already-changed nodes (reconnecting with the new
-  password) and updates its in-memory credential only on full success. A non-root change
-  uses `ACL SETUSER <u> resetpass on #<sha256>` best-effort across nodes.
+- **UpdateUser** — password change, two callers. **Root rotation** (`vault rotate-root`) on
+  the configured root user: rotate the admin password on every node **all-or-nothing** — if
+  any node fails, restore the old password on the already-changed nodes (reconnecting with
+  the new password), updating the in-memory credential only on full success. **Static-role
+  rotation** (a non-root, Vault-managed *shared* user): apply `ACL SETUSER <u> resetpass on
+  #<sha256>` across every node, then run the reconcile pass so a replica that missed a
+  rotation re-converges. The static user must pre-exist with its ACL rules on all nodes
+  (Vault rotates, it does not create); name it with `managed_username_prefix` so reconcile
+  covers it. A node down during a rotation re-converges on the next rotation.
 - **DeleteUser** — `ACL DELUSER <u>` on every node; idempotent (absent user is success),
   errors aggregated but all nodes attempted.
 - **Initialize** — parse/validate config; declare supported credential type (password);

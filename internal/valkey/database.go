@@ -190,10 +190,10 @@ func (v *valkeyDB) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (db
 	return dbplugin.NewUserResponse{Username: username}, nil
 }
 
-// UpdateUser handles password changes. The dominant caller is root rotation
-// (vault rotate-root), which arrives as UpdateUser on the configured root user;
-// that path is all-or-nothing with rollback. A non-root password change (rare for
-// dynamic creds) is applied best-effort across nodes.
+// UpdateUser handles password changes. Two callers: root rotation (vault rotate-root)
+// on the configured root user — all-or-nothing with rollback; and a non-root password
+// change — the Vault static-role rotation path — applied across all nodes, then reconciled
+// so a replica that missed a rotation converges to the master.
 func (v *valkeyDB) UpdateUser(ctx context.Context, req dbplugin.UpdateUserRequest) (dbplugin.UpdateUserResponse, error) {
 	if req.Password == nil {
 		return dbplugin.UpdateUserResponse{}, nil
@@ -230,6 +230,15 @@ func (v *valkeyDB) UpdateUser(ctx context.Context, req dbplugin.UpdateUserReques
 			// Best-effort: a stale Sentinel-side password only affects discovery, and the
 			// app re-fetches credentials on restart. Log, don't fail the rotation.
 			v.logger.Warn("Sentinel-side password update failed (best-effort)", "user", req.Username, "error", err)
+		}
+	}
+	// Static-role rotation lands here; converge the topology so a managed user a replica
+	// missed during this or an earlier rotation is re-asserted from the master (the same pass
+	// NewUser runs). Best-effort, non-fatal. Name the static user with managed_username_prefix
+	// so reconcile covers it.
+	if cfg.Reconcile && len(topo.Nodes) > 1 {
+		if issues := topo.reconcile(ctx, dataOps, cfg.ManagedUsernamePrefix, cfg.Username); len(issues) > 0 {
+			v.logger.Warn("reconcile pass reported node drift after rotation (non-fatal)", "issues", strings.Join(issues, "; "))
 		}
 	}
 	v.logger.Info("updated user password", "user", req.Username, "nodes", len(topo.Nodes))

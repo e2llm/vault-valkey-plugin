@@ -8,7 +8,7 @@ issues **dynamic Valkey credentials** across a **Sentinel-managed** primary/repl
 topology — including correct behaviour across failover — and supports a **separate,
 low-privilege identity for Sentinel discovery**.
 
-> Status: **released (v1.2.0).** Production-hardened — unit, live-cluster integration,
+> Status: **released (v1.3.0).** Production-hardened — unit, live-cluster integration,
 > and real-Vault end-to-end tests pass on Vault 1.14 and 1.21; see `CHANGELOG.md`.
 
 ## Why a dedicated plugin
@@ -122,6 +122,30 @@ operation re-resolves to it — and converges each data node to it.
 
 Managed users are identified by `managed_username_prefix` (default `v_`); static and admin
 accounts are never touched. Set `reconcile=false` to disable.
+
+## Static roles (shared credential rotation)
+
+Dynamic creds mint a unique user per lease. If instead you have **one shared account** used by
+many clients and a policy to rotate it periodically, use a Vault **static role** — the plugin
+rotates the existing user's password across every Sentinel node:
+
+```bash
+# the shared user must already exist WITH its ACL rules on every node (Vault rotates, not creates);
+# name it with the managed prefix (default v_) so reconcile keeps it converged
+vault write database/static-roles/app-shared \
+    db_name="my-valkey" username="v_app_shared" \
+    rotation_period="4380h"          # ~6 months  (or rotation_schedule="0 0 1 1,7 *")
+
+vault read database/static-creds/app-shared   # current shared password + time to next rotation
+```
+
+All clients read `static-creds` and get the same current password; Vault bounds its age. Note
+that rotating a shared password affects every current holder — clients should re-fetch (VSO /
+Vault Agent) and reconnect on `WRONGPASS`.
+
+For rotation coupled to **restarts** rather than a timer, `contrib/lazy-rotate.sh` rotates
+lazily at pod start when the password is older than a threshold (see its header for the
+compliance trade-off).
 
 ## Compatibility
 
